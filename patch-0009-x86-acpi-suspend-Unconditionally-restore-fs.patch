@@ -1,0 +1,93 @@
+From bc97b21a7566d6ce03ae344c6223b0e4d1b0637f Mon Sep 17 00:00:00 2001
+From: "M. Vefa Bicakci" <m.v.b@runbox.com>
+Date: Sat, 11 Jul 2020 15:34:27 +0300
+Subject: [PATCH 9/9] x86/acpi/suspend: Unconditionally restore %fs
+
+In summary, the fact that the %fs register is overwritten by wakeup.S
+during resume from suspend-to-RAM appears to cause unexpected behaviour
+with the way Xen and Linux handle the %fs register during context
+switching.
+
+Prior to this commit, during the resume from suspend-to-RAM the
+systemd-sleep process running on top of Linux in dom0 would occasionally
+encounter a segmentation fault. Curiously, this behaviour is only seen
+with the following commit: eb91201107 ("x86/ACPI: re-park previously
+parked CPUs upon resume from S3").
+
+Further debugging by instrumenting the context-switch and suspend/resume
+code paths indicated that the value of the %fs register set by
+xen/arch/x86/boot/wakeup.S (i.e., the value 0x9b00) would leak all
+the way to dom0's user-space.
+
+For further details, I am quoting from the comment inserted by this
+commit above the code change:
+
+  %fs is overwritten by wakeup_start in xen/arch/x86/boot/wakeup.S
+  during a resume from suspend-to-RAM.
+
+  During a context switch to a non-idle domain in Xen, segments are
+  only re-loaded from the saved context (in the load_segments function)
+  if the saved segment register states hold non-zero values, or if
+  the previous context was not the idle domain and had a non-zero
+  segment register value.
+
+  Given that %fs usually holds the value zero, this means that the FS
+  segment is not usually re-loaded after a resume from suspend, which
+  causes the value of %fs used in wakeup.S (which happens to be 0x9b00)
+  to leak to the first domain towards which a context switch occurs
+  (dom0 in experience) after resume from suspend. This in turn causes
+  unexpected crashes in dom0 caused by a non-zero %fs register value
+  (systemd-sleep segfaults while attempting to access thread-local
+  storage data in dom0 via %fs).
+
+  Hence, the next line restores %fs unconditionally.
+
+Signed-off-by: M. Vefa Bicakci <m.v.b@runbox.com>
+---
+ xen/arch/x86/acpi/suspend.c | 27 ++++++++++++++++++++++++++-
+ 1 file changed, 26 insertions(+), 1 deletion(-)
+
+diff --git a/xen/arch/x86/acpi/suspend.c b/xen/arch/x86/acpi/suspend.c
+index d5c67ee1f33b..054185fb8bac 100644
+--- a/xen/arch/x86/acpi/suspend.c
++++ b/xen/arch/x86/acpi/suspend.c
+@@ -70,10 +70,35 @@ void restore_rest_processor_state(void)
+         wrmsr(MSR_IA32_SYSENTER_CS, __HYPERVISOR_CS, 0);
+     }
+ 
++    /*
++     * %fs is overwritten by wakeup_start in xen/arch/x86/boot/wakeup.S
++     * during a resume from suspend-to-RAM.
++     *
++     * During a context switch to a non-idle domain in Xen, segments are
++     * only re-loaded from the saved context (in the load_segments function)
++     * if the saved segment register states hold non-zero values, or if
++     * the previous context was not the idle domain and had a non-zero
++     * segment register value.
++     *
++     * Given that %fs usually holds the value zero, this means that the FS
++     * segment is not usually re-loaded after a resume from suspend, which
++     * causes the value of %fs used in wakeup.S (which happens to be 0x9b00)
++     * to leak to the first domain towards which a context switch occurs
++     * (dom0 in experience) after resume from suspend. This in turn causes
++     * unexpected crashes in dom0 caused by a non-zero %fs register value
++     * (systemd-sleep segfaults while attempting to access thread-local
++     * storage data in dom0 via %fs).
++     *
++     * Hence, the next line restores %fs unconditionally.
++     */
++    asm volatile (
++        "movw 4(%0),%%fs"
++        : : "r" (saved_segs) : "memory" );
++
+     if ( !is_idle_vcpu(curr) )
+     {
+         asm volatile (
+-            "movw (%0),%%ds; movw 2(%0),%%es; movw 4(%0),%%fs"
++            "movw (%0),%%ds; movw 2(%0),%%es"
+             : : "r" (saved_segs) : "memory" );
+         do_set_segment_base(SEGBASE_GS_USER_SEL, saved_segs[3]);
+     }
+-- 
+2.26.2
+
